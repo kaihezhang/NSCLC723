@@ -1,0 +1,361 @@
+import os
+import json
+import numpy as np
+import pandas as pd
+import torch
+import nibabel as nib
+from PIL import Image
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier
+from sklearn.linear_model import LogisticRegression, RidgeClassifier, SGDClassifier
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.feature_selection import RFE
+from sklearn.metrics import roc_auc_score, f1_score, recall_score, precision_score
+from scipy.stats import pearsonr, spearmanr, kendalltau
+from sklearn.linear_model import LassoCV, ElasticNetCV
+from boruta import BorutaPy
+from sklearn.cross_decomposition import PLSRegression
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+
+warnings.filterwarnings("ignore")
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+N_JOBS = 1
+
+LABELS_XLSX = r'C:\Users\95602\Desktop\ultrasound-contrastivemodels-klr-us-rna\TCIA\TCIA\TCIA-cohorts1.xlsx'
+bbox_json_path = r'C:\Users\95602\PycharmProjects\PythonProject2\bbox_coords.json'
+image_directory = r'C:\Users\95602\Desktop\ultrasound-contrastivemodels-klr-us-rna\TCIA\TCIA'
+MODEL_PATH = r'C:\Users\95602\Desktop\ultrasound-contrastivemodels-klr-us-rna\TCIA\TCIA\14best_clip_lrp01.pth'
+N_CHANNELS = 16
+IMG_SIZE = 224
+EMBED_DIM = 256
+
+df_label = pd.read_excel(LABELS_XLSX, dtype=str)
+df_label['PDL1'] = df_label['PDL1'].astype(float)
+patient_id_list = df_label['Patient.ID'].tolist()
+pdl1_label_list = df_label['PDL1'].tolist()
+
+with open(bbox_json_path, 'r') as f:
+    bbox_coords = json.load(f)
+
+nifti_files = {}
+for root, _, files in os.walk(image_directory):
+    for fname in files:
+        if fname.lower().endswith('.nii') or fname.lower().endswith('.nii.gz'):
+            base = os.path.splitext(os.path.splitext(fname)[0])[0]
+            nifti_files[base] = os.path.join(root, fname)
+
+
+def sample_slices(total_slices, n=N_CHANNELS):
+    if total_slices < n:
+        idxs = list(range(total_slices)) + [total_slices // 2] * (n - total_slices)
+        return idxs[:n]
+    else:
+        return np.linspace(0, total_slices - 1, n, dtype=int)
+
+
+from model import ResNetMultiChannel
+
+ResNet_encoder = ResNetMultiChannel(n_channels=N_CHANNELS, embedding_dim=EMBED_DIM)
+ResNet_encoder = ResNet_encoder.to(DEVICE)
+state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
+if any(k.startswith("image_encoder.") for k in state_dict.keys()):
+    image_encoder_state = {k.replace("image_encoder.", ""): v for k, v in state_dict.items() if
+                           k.startswith("image_encoder.")}
+    ResNet_encoder.load_state_dict(image_encoder_state, strict=False)
+elif "image_encoder" in state_dict:
+    ResNet_encoder.load_state_dict(state_dict["image_encoder"], strict=False)
+else:
+    ResNet_encoder.load_state_dict(state_dict, strict=False)
+ResNet_encoder.eval()
+
+
+def extract_ct_embedding(patient_id):
+    matches = []
+    for ext in [".nii.gz", ".nii"]:
+        base = patient_id
+        if base in nifti_files and nifti_files[base].endswith(ext):
+            matches.append(nifti_files[base])
+    if not matches:
+        return None
+    img_path = matches[0]
+    seg_key = 'seg' + patient_id.replace('-', '') + '.nii.gz'
+    if seg_key not in bbox_coords:
+        return None
+
+    vol = nib.load(img_path).get_fdata()
+    bbox = bbox_coords[seg_key]
+    x0, x1 = sorted((bbox['x_min'], bbox['x_max']))
+    y0, y1 = sorted((bbox['y_min'], bbox['y_max']))
+    z0, z1 = sorted((bbox['z_min'], bbox['z_max']))
+    roi = vol[x0:x1, y0:y1, z0:z1]
+    if roi.shape[2] == 0:
+        return None
+    slice_idxs = sample_slices(roi.shape[2], n=N_CHANNELS)
+    imgs = [roi[:, :, i] for i in slice_idxs]
+    imgs = np.stack(imgs, axis=0)
+    imgs = (imgs - imgs.min()) / (imgs.max() - imgs.min() + 1e-8)
+    imgs_resized = []
+    for i in range(N_CHANNELS):
+        img = Image.fromarray((imgs[i] * 255).astype(np.uint8))
+        img = img.resize((IMG_SIZE, IMG_SIZE))
+        imgs_resized.append(np.array(img, dtype=np.float32) / 255.0)
+    imgs_tensor = torch.tensor(np.stack(imgs_resized, axis=0), dtype=torch.float).unsqueeze(0)
+    imgs_tensor = imgs_tensor.to(DEVICE)
+    with torch.no_grad():
+        embedding = ResNet_encoder(imgs_tensor)
+    return embedding.cpu().numpy().squeeze()
+
+
+X, Y = [], []
+for pid, label in zip(patient_id_list, pdl1_label_list):
+    emb = extract_ct_embedding(pid)
+    if emb is not None:
+        X.append(emb)
+        Y.append(int(label))
+X = np.array(X)
+Y = np.array(Y)
+
+
+def rfe_select(X, Y, n_features=16):
+    estimator = LogisticRegression(max_iter=1000, solver='liblinear')
+    selector = RFE(estimator, n_features_to_select=min(n_features, X.shape[1]))
+    X_new = selector.fit_transform(X, Y)
+    return X_new
+
+
+def pearson_select(X, Y, n_features=16):
+    scores = [abs(pearsonr(X[:, i], Y)[0]) for i in range(X.shape[1])]
+    idx = np.argsort(scores)[-min(n_features, len(scores)):]
+    return X[:, idx], idx
+
+
+def spearman_select(X, Y, n_features=16):
+    scores = [abs(spearmanr(X[:, i], Y)[0]) for i in range(X.shape[1])]
+    idx = np.argsort(scores)[-min(n_features, len(scores)):]
+    return X[:, idx], idx
+
+
+def kendall_select(X, Y, n_features=16):
+    scores = [abs(kendalltau(X[:, i], Y)[0]) for i in range(X.shape[1])]
+    idx = np.argsort(scores)[-min(n_features, len(scores)):]
+    return X[:, idx], idx
+
+
+def lasso_select(X, Y, n_features=16):
+    lasso = LassoCV(cv=5, max_iter=1000).fit(X, Y)
+    importance = np.abs(lasso.coef_)
+    idx = np.argsort(importance)[-min(n_features, len(importance)):]
+    return X[:, idx], idx
+
+
+def enet_select(X, Y, n_features=16):
+    enet = ElasticNetCV(cv=5, max_iter=1000).fit(X, Y)
+    importance = np.abs(enet.coef_)
+    idx = np.argsort(importance)[-min(n_features, len(importance)):]
+    return X[:, idx], idx
+
+
+def boruta_select(X, Y, n_features=16):
+    rf = RandomForestClassifier(n_jobs=N_JOBS, class_weight='balanced', max_depth=5, n_estimators=50)
+    boruta_selector = BorutaPy(rf, n_estimators='auto', verbose=0, random_state=42, max_iter=10)
+    boruta_selector.fit(X, Y)
+    idx = np.where(boruta_selector.support_)[0]
+    if len(idx) > n_features:
+        idx = idx[:n_features]
+    elif len(idx) < n_features:
+        remaining = n_features - len(idx)
+        remaining_idx = np.where(~boruta_selector.support_)[0][:remaining]
+        idx = np.concatenate([idx, remaining_idx])
+    return X[:, idx], idx
+
+
+def pls_select(X, Y, n_features=16):
+    n_comp = min(n_features, X.shape[1], X.shape[0] - 1)
+    pls = PLSRegression(n_components=n_comp)
+    X_new = pls.fit_transform(X, Y)[0]
+    return X_new[:, :n_features]
+
+
+def glm_select(X, Y, n_features=16):
+    model = sm.GLM(Y, sm.add_constant(X), family=sm.families.Binomial()).fit()
+    coef = np.abs(model.params[1:])
+    idx = np.argsort(coef)[-min(n_features, len(coef)):]
+    return X[:, idx], idx
+
+
+class PLSClassifier:
+    def __init__(self, n_components=2):
+        self.n_components = n_components
+        self.pls = PLSRegression(n_components=n_components)
+        self.lr = LogisticRegression(max_iter=1000)
+
+    def fit(self, X, y):
+        X_pls = self.pls.fit_transform(X, y)[0]
+        self.lr.fit(X_pls, y)
+        return self
+
+    def predict_proba(self, X):
+        X_pls = self.pls.transform(X)
+        return self.lr.predict_proba(X_pls)
+
+    def predict(self, X):
+        return self.lr.predict(self.pls.transform(X))
+
+
+# 提取重复的特征选择逻辑
+def apply_feature_selection(X_train, X_test, y_train, feat_name, feat_func):
+    if feat_name in ['Pearson', 'Spearman', 'Kendall', 'Lasso', 'ENet', 'Boruta', 'GLM']:
+        X_train_f, selected_idx = feat_func(X_train, y_train)
+        X_test_f = X_test[:, selected_idx]
+    else:
+        X_train_f = feat_func(X_train, y_train)
+        if feat_name.startswith('PCA'):
+            pca = PCA(n_components=X_train_f.shape[1])
+            pca.fit(X_train)
+            X_test_f = pca.transform(X_test)
+        elif feat_name.startswith('RFE'):
+            estimator = LogisticRegression(max_iter=1000, solver='liblinear')
+            selector = RFE(estimator, n_features_to_select=X_train_f.shape[1])
+            selector.fit(X_train, y_train)
+            X_test_f = selector.transform(X_test)
+        elif feat_name == 'PLS':
+            n_comp = min(16, X_train.shape[1], X_train.shape[0] - 1)
+            pls = PLSRegression(n_components=n_comp)
+            pls.fit(X_train, y_train)
+            X_test_f = pls.transform(X_test)[:, :X_train_f.shape[1]]
+        else:
+            X_test_f = X_test
+    return X_train_f, X_test_f
+
+
+feature_methods = {
+    'Raw': lambda X, Y: X,
+    'PCA-8': lambda X, Y: PCA(n_components=min(8, X.shape[1])).fit_transform(X),
+    'PCA-16': lambda X, Y: PCA(n_components=min(16, X.shape[1])).fit_transform(X),
+    'PCA-32': lambda X, Y: PCA(n_components=min(32, X.shape[1])).fit_transform(X),
+    'RFE-16': lambda X, Y: rfe_select(X, Y, n_features=16),
+    'Pearson': pearson_select,
+    'Spearman': spearman_select,
+    'Kendall': kendall_select,
+    'Lasso': lasso_select,
+    'ENet': enet_select,
+    'Boruta': boruta_select,
+    'PLS': lambda X, Y: pls_select(X, Y, n_features=16),
+    'GLM': glm_select
+}
+
+model_dict = {
+    'LR': LogisticRegression(max_iter=2000, solver='liblinear', random_state=42),
+    'Ridge': RidgeClassifier(random_state=42),
+    'SGD': SGDClassifier(loss='log_loss', max_iter=1000, random_state=42),
+    'Lasso-LR': LogisticRegression(penalty='l1', solver='liblinear', max_iter=2000, random_state=42),
+    'ENet-LR': LogisticRegression(penalty='elasticnet', l1_ratio=0.5, solver='saga', max_iter=2000, random_state=42),
+    'RF': RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=N_JOBS),
+    'DT': DecisionTreeClassifier(random_state=42),
+    'GBDT': GradientBoostingClassifier(n_estimators=100, random_state=42),
+    'AdaBoost': AdaBoostClassifier(n_estimators=100, random_state=42),
+    'SVM-RBF': SVC(probability=True, kernel='rbf', random_state=42),
+    'SVM-Linear': SVC(probability=True, kernel='linear', random_state=42),
+    'SVM-Poly': SVC(probability=True, kernel='poly', degree=3, random_state=42),
+    'KNN-5': KNeighborsClassifier(n_neighbors=5),
+    'KNN-10': KNeighborsClassifier(n_neighbors=10),
+    'KNN-15': KNeighborsClassifier(n_neighbors=15),
+    'MLP-Small': MLPClassifier(hidden_layer_sizes=(32,), max_iter=1000, random_state=42),
+    'MLP-Medium': MLPClassifier(hidden_layer_sizes=(64,), max_iter=1000, random_state=42),
+    'MLP-Large': MLPClassifier(hidden_layer_sizes=(128, 64), max_iter=1000, random_state=42),
+    'NB': GaussianNB(),
+    'PLS-2': PLSClassifier(n_components=2),
+    'PLS-5': PLSClassifier(n_components=5),
+}
+
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+results = np.zeros((len(model_dict), len(feature_methods)))
+
+for i, (model_name, model) in enumerate(model_dict.items()):
+    for j, (feat_name, feat_func) in enumerate(feature_methods.items()):
+        aucs = []
+        for train_idx, test_idx in skf.split(X_scaled, Y):
+            X_train, X_test = X_scaled[train_idx], X_scaled[test_idx]
+            y_train, y_test = Y[train_idx], Y[test_idx]
+
+            X_train_f, X_test_f = apply_feature_selection(X_train, X_test, y_train, feat_name, feat_func)
+            model.fit(X_train_f, y_train)
+
+            if hasattr(model, "predict_proba"):
+                y_prob = model.predict_proba(X_test_f)[:, 1]
+            else:
+                y_prob = model.decision_function(X_test_f)
+                if y_prob.ndim > 1:
+                    y_prob = y_prob[:, 0]
+            auc = roc_auc_score(y_test, y_prob)
+            aucs.append(auc)
+        results[i, j] = np.mean(aucs)
+
+plt.figure(figsize=(max(0.7 * len(feature_methods), 7), max(0.5 * len(model_dict), 6)))
+sns.heatmap(
+    results,
+    annot=False, fmt=".3f", cmap="OrRd",
+    xticklabels=list(feature_methods.keys()),
+    yticklabels=list(model_dict.keys()),
+    cbar_kws={'label': 'ROC-AUC Score'},
+)
+plt.xlabel("Feature Dimension Reduction", fontsize=16)
+plt.ylabel("Classifier", fontsize=16)
+plt.title("Five-fold ROC-AUC Heatmap for PD-L1 Prediction", fontsize=18)
+plt.xticks(fontsize=13, rotation=30, ha='right')
+plt.yticks(fontsize=13)
+plt.tight_layout()
+plt.show()
+
+best_result = np.max(results)
+best_pos = np.unravel_index(np.argmax(results), results.shape)
+best_model = list(model_dict.keys())[best_pos[0]]
+best_feature = list(feature_methods.keys())[best_pos[1]]
+print(f"\nBest AUC: {best_result:.4f}")
+print(f"Best combination: {best_model} + {best_feature}")
+
+flat_results = []
+for i in range(results.shape[0]):
+    for j in range(results.shape[1]):
+        flat_results.append((results[i, j], list(model_dict.keys())[i], list(feature_methods.keys())[j]))
+flat_results.sort(reverse=True)
+print(f"\nTop 10 model-feature combinations:")
+for rank, (auc, model, feature) in enumerate(flat_results[:10], 1):
+    print(f"{rank:2d}. {auc:.4f} - {model:12s} + {feature}")
+
+top3 = flat_results[:3]
+print("\nF1-score, Recall, Precision for Top 3 combinations:")
+for auc, model_name, feature_name in top3:
+    model = model_dict[model_name]
+    feat_func = feature_methods[feature_name]
+    f1_list, recall_list, precision_list = [], [], []
+    for train_idx, test_idx in skf.split(X_scaled, Y):
+        X_train, X_test = X_scaled[train_idx], X_scaled[test_idx]
+        y_train, y_test = Y[train_idx], Y[test_idx]
+
+        X_train_f, X_test_f = apply_feature_selection(X_train, X_test, y_train, feature_name, feat_func)
+        model.fit(X_train_f, y_train)
+
+        if hasattr(model, "predict_proba"):
+            y_pred = (model.predict_proba(X_test_f)[:, 1] >= 0.5).astype(int)
+        else:
+            y_pred = model.predict(X_test_f)
+        f1_list.append(f1_score(y_test, y_pred, zero_division=0))
+        recall_list.append(recall_score(y_test, y_pred, zero_division=0))
+        precision_list.append(precision_score(y_test, y_pred, zero_division=0))
+    print(f"\nModel: {model_name} | Feature: {feature_name}")
+    print(f"  F1-score: {np.mean(f1_list):.3f}")
+    print(f"  Recall:   {np.mean(recall_list):.3f}")
+    print(f"  Precision:{np.mean(precision_list):.3f}")
